@@ -18,6 +18,7 @@ SECRETS_FILE="/etc/supertext/provisioning.env"
 DONE_MARKER="/var/lib/supertext/first-boot-complete"
 
 log() { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ "$EUID" -eq 0 ]] || die "first_boot.sh must run as root."
@@ -32,11 +33,18 @@ fi
 # expand $ or backticks in the value
 env_get() {
     local file="$1" key="$2" line value
-    line="$(grep -E "^[[:space:]]*${key}=" "$file" | tail -n 1 || true)"
+    local dq='^"([^"]*)"[[:space:]]*(#.*)?$' sq="^'([^']*)'[[:space:]]*(#.*)?$"
+    line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" | tail -n 1 || true)"
     value="${line#*=}"
     value="${value%$'\r'}"
-    if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${value#"${value%%[![:space:]]*}"}"
+    if [[ "$value" =~ $dq || "$value" =~ $sq ]]; then
         value="${BASH_REMATCH[1]}"
+    elif [[ "$value" == [\"\']* ]]; then
+        die "$key in supertext.env has a quote that is not closed. Leave the quotes off, or use single quotes if the value contains a \" character."
+    else
+        value="${value%%[[:space:]]#*}"
+        value="${value%"${value##*[![:space:]]}"}"
     fi
     printf '%s' "$value"
 }
@@ -53,6 +61,16 @@ fi
 [[ -f "$SECRETS_FILE" ]] || \
     die "Missing $SECRETS_FILE. Put supertext.env on the SD card's boot partition before first boot."
 
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]] || continue
+    case "${BASH_REMATCH[1]}" in
+        
+POGO_AP_PASSWORD|POGO_APP_USER|POGO_SSID|POGO_AP_CONNECTION|POGO_WIFI_IF) ;;
+        *) warn "supertext.env has an unknown setting ${BASH_REMATCH[1]}; it is ignored. Check its spelling." ;;
+    esac
+done < "$SECRETS_FILE"
+
 POGO_AP_PASSWORD="$(env_get "$SECRETS_FILE" POGO_AP_PASSWORD)"
 POGO_APP_USER="$(env_get "$SECRETS_FILE" POGO_APP_USER)"
 POGO_SSID="$(env_get "$SECRETS_FILE" POGO_SSID)"
@@ -63,7 +81,9 @@ POGO_WIFI_IF="$(env_get "$SECRETS_FILE" POGO_WIFI_IF)"
 [[ "$POGO_AP_PASSWORD" != "CHANGE_THIS_TO_A_UNIQUE_WIFI_PASSWORD" ]] || \
     die "Replace the example hotspot password in supertext.env before booting the Pi."
 (( ${#POGO_AP_PASSWORD} >= 8 && ${#POGO_AP_PASSWORD} <= 63 )) || \
-    die "POGO_AP_PASSWORD must be between 8 and 63 characters."
+    die "The hotspot password (POGO_AP_PASSWORD) must be 8 to 63 characters long."
+LC_ALL=C grep -q '^[ -~]*$' <<<"$POGO_AP_PASSWORD" || \
+    die "The hotspot password (POGO_AP_PASSWORD) may only contain basic letters, numbers, and symbols."
 
 log "Identifying the first normal user created in Raspberry Pi Imager"
 APP_USER="${POGO_APP_USER:-$(getent passwd 1000 | cut -d: -f1)}"
@@ -88,13 +108,16 @@ apt-get install -y ca-certificates git
 run_as_app() { runuser -u "$APP_USER" -- env HOME="$APP_HOME" "$@"; }
 
 HW_DIR="$APP_HOME/$HW_DIR_NAME"
+if [[ -e "$HW_DIR" && ! -d "$HW_DIR/.git" ]]; then
+    HW_BACKUP="$HW_DIR.backup-$(date +%Y%m%d-%H%M%S)"
+    warn "$HW_DIR is not a Git checkout. Moving it to $HW_BACKUP and cloning a fresh copy."
+    mv -- "$HW_DIR" "$HW_BACKUP"
+fi
 if [[ -d "$HW_DIR/.git" ]]; then
     log "Reusing the existing hardware checkout at $HW_DIR"
     run_as_app git -C "$HW_DIR" fetch origin "$HW_REPO_BRANCH"
     run_as_app git -C "$HW_DIR" checkout "$HW_REPO_BRANCH"
     run_as_app git -C "$HW_DIR" merge --ff-only "origin/$HW_REPO_BRANCH"
-elif [[ -e "$HW_DIR" ]]; then
-    die "$HW_DIR exists but is not a Git checkout. Move it aside and retry."
 else
     log "Cloning the hardware repo ($HW_REPO_BRANCH) into $HW_DIR"
     run_as_app git clone --branch "$HW_REPO_BRANCH" --single-branch "$HW_REPO_URL" "$HW_DIR"

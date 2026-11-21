@@ -11,9 +11,10 @@ set -Eeuo pipefail
 SSID="${POGO_SSID:-POGOSupertext}"
 AP_CONNECTION="${POGO_AP_CONNECTION:-POGOSupertext}"
 WIFI_IF="${POGO_WIFI_IF:-wlan0}"
-AP_ADDRESS="10.42.0.1/24"
+AP_ADDRESS="10.42.0.1/22"
 APP_PORT=8081
 BINARY_NAME="supertext_server"
+GO_VERSION="${POGO_GO_VERSION:-1.27.4}"
 APP_REPO_URL="${POGO_APP_REPO_URL:-https://github.com/POGO-Supertext-Capstone/Supertext.git}"
 APP_BRANCH="${POGO_APP_BRANCH:-main}"
 DNSMASQ_SOURCE="config/dnsmasq/captive.conf"
@@ -39,6 +40,8 @@ HW_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="${POGO_APP_DIR:-$APP_HOME/Supertext}"
 [[ -f "$HW_DIR/$DNSMASQ_SOURCE" ]] || die "Missing $DNSMASQ_SOURCE in the hardware repo ($HW_DIR)."
 [[ -f "$HW_DIR/$SERVICE_TEMPLATE" ]] || die "Missing $SERVICE_TEMPLATE in the hardware repo ($HW_DIR)."
+DATA_DIR="$(sed -n 's/^Environment=SUPERTEXT_DATA_DIR=//p' "$HW_DIR/$SERVICE_TEMPLATE")"
+[[ -n "$DATA_DIR" ]] || die "$SERVICE_TEMPLATE has no Environment=SUPERTEXT_DATA_DIR= line."
 
 [[ -r /etc/os-release ]] || die "Cannot identify the operating system."
 . /etc/os-release
@@ -47,8 +50,8 @@ APP_DIR="${POGO_APP_DIR:-$APP_HOME/Supertext}"
 
 validate_password() {
     local p="$1"
-    (( ${#p} >= 8 && ${#p} <= 63 )) || die "The Wi-Fi passphrase must be between 8 and 63 characters."
-    LC_ALL=C grep -q '^[ -~]*$' <<<"$p" || die "The Wi-Fi passphrase may only contain printable ASCII characters."
+    (( ${#p} >= 8 && ${#p} <= 63 )) || die "The hotspot passphrase must be between 8 and 63 characters."
+    LC_ALL=C grep -q '^[ -~]*$' <<<"$p" || die "The hotspot passphrase may only contain basic letters, numbers, and symbols."
 }
 
 # hotspot password comes from first_boot.sh or a prompt
@@ -61,11 +64,11 @@ if command -v nmcli >/dev/null 2>&1 && nmcli connection show "$AP_CONNECTION" >/
 fi
 if [[ -z "$AP_PASSWORD" && "$HAVE_AP_PROFILE" -eq 0 ]]; then
     [[ -t 0 ]] || die "No hotspot password supplied and no terminal to ask on. Set POGO_AP_PASSWORD."
-    read -r -s -p "Enter the WPA2 passphrase for $SSID (8-63 characters): " AP_PASSWORD
+    read -r -s -p "Enter the hotspot password for $SSID (8-63 characters): " AP_PASSWORD
     printf '\n'
-    read -r -s -p "Confirm the Wi-Fi passphrase: " AP_PASSWORD_CONFIRM
+    read -r -s -p "Confirm the hotspot password: " AP_PASSWORD_CONFIRM
     printf '\n'
-    [[ "$AP_PASSWORD" == "$AP_PASSWORD_CONFIRM" ]] || die "The passphrases did not match."
+    [[ "$AP_PASSWORD" == "$AP_PASSWORD_CONFIRM" ]] || die "The two passwords did not match."
     unset AP_PASSWORD_CONFIRM
 fi
 [[ -z "$AP_PASSWORD" ]] || validate_password "$AP_PASSWORD"
@@ -98,17 +101,22 @@ PHY_INFO="$(iw "phy$WIPHY" info)"
 grep -Eq '^[[:space:]]*\*[[:space:]]+AP([[:space:]]|$)' <<<"$PHY_INFO" || \
     die "The Wi-Fi adapter behind $WIFI_IF does not report AP mode support."
 
-as_app() { runuser -u "$APP_USER" -- env HOME="$APP_HOME" GOTOOLCHAIN=auto "$@"; }
+as_app() { runuser -u "$APP_USER" -- env HOME="$APP_HOME" GOTOOLCHAIN="go$GO_VERSION" "$@"; }
 
+# replace with fresh clone instead of dying if not fresh checkout
 log "Getting the Supertext application source"
+if [[ -e "$APP_DIR" && ! -d "$APP_DIR/.git" ]]; then
+    APP_BACKUP="$APP_DIR.backup-$(date +%Y%m%d-%H%M%S)"
+    warn "$APP_DIR is not a Git checkout. Moving it to $APP_BACKUP and cloning a fresh copy."
+    mv -- "$APP_DIR" "$APP_BACKUP"
+fi
 if [[ -d "$APP_DIR/.git" ]]; then
     log "Using the existing application checkout at $APP_DIR (deploy.sh updates it)"
-elif [[ -e "$APP_DIR" ]]; then
-    die "$APP_DIR exists but is not a Git checkout. Move it aside and retry."
 else
     as_app git clone --branch "$APP_BRANCH" --single-branch "$APP_REPO_URL" "$APP_DIR"
 fi
 [[ -f "$APP_DIR/go.mod" ]] || die "go.mod not found in $APP_DIR."
+[[ -f "$APP_DIR/go.sum" ]] || die "go.sum not found in $APP_DIR. Run 'go mod tidy' in the Supertext repo and commit go.sum."
 [[ -f "$APP_DIR/cmd/main.go" ]] || die "Expected Go entry point cmd/main.go was not found in $APP_DIR."
 
 EXCLUDE_FILE="$APP_DIR/.git/info/exclude"
@@ -117,9 +125,8 @@ if [[ -d "$APP_DIR/.git/info" ]] && ! grep -qxF '/build/' "$EXCLUDE_FILE" 2>/dev
     chown "$APP_USER:$APP_GROUP" "$EXCLUDE_FILE"
 fi
 
-log "Building $BINARY_NAME as $APP_USER (the first build may download Go 1.27 and modules)"
+log "Building $BINARY_NAME as $APP_USER with Go $GO_VERSION (the first build may download Go 1.27.4 and modules)"
 install -d -o "$APP_USER" -g "$APP_GROUP" "$APP_DIR/build"
-install -d -o "$APP_USER" -g "$APP_GROUP" "$APP_HOME/.local/share"
 cd "$APP_DIR"
 as_app go mod download
 PACKAGE_NAME="$(as_app go list -f '{{.Name}}' ./cmd)"
@@ -187,6 +194,15 @@ iptables -w -t nat -A PREROUTING -i "$WIFI_IF" -p tcp --dport 80 \
 systemctl enable netfilter-persistent
 netfilter-persistent save
 
+log "Preparing the database folder $DATA_DIR"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$DATA_DIR"
+OLD_DB="$APP_HOME/.config/Supertext/database.db"
+if [[ -f "$OLD_DB" && ! -e "$DATA_DIR/database.db" ]]; then
+    log "Copying the existing database from $OLD_DB"
+    systemctl stop supertext.service 2>/dev/null || true
+    install -o "$APP_USER" -g "$APP_GROUP" -m 0600 "$OLD_DB" "$DATA_DIR/database.db"
+fi
+
 log "Installing the systemd service"
 SERVICE_TMP="$(mktemp)"
 trap 'rm -f "${BUILD_TMP:-}" "${SERVICE_TMP:-}"' EXIT
@@ -229,6 +245,7 @@ Hotspot address:        $AP_ADDRESS
 Application checkout:   $APP_DIR
 Application executable: $APP_DIR/build/$BINARY_NAME
 Application HTTP port:  $APP_PORT
+Go toolchain:           go$GO_VERSION
 Hardware repo:          $HW_DIR
 Systemd service:        supertext.service
 

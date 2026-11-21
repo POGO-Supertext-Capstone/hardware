@@ -45,7 +45,8 @@ for tool in go git sudo curl; do
 done
 
 # Go 1.27.4+ is required but debian packages an older Go so fetch the right toolchain
-export GOTOOLCHAIN=auto
+GO_VERSION="${POGO_GO_VERSION:-1.27.4}"
+export GOTOOLCHAIN="go$GO_VERSION"
 
 
 BUILD_TMP=""
@@ -91,7 +92,9 @@ sync_repo() {
 
 sync_repo "$HW_DIR" "hardware repo"
 sync_repo "$APP_DIR" "application repo"
-[[ -f "$APP_DIR/go.mod" && -f "$APP_DIR/cmd/main.go" ]] || die "Expected go.mod and cmd/main.go were not found in $APP_DIR."
+for f in go.mod go.sum cmd/main.go; do
+    [[ -f "$APP_DIR/$f" ]] || die "$APP_DIR/$f is missing. The application repo must contain go.mod, go.sum and cmd/main.go."
+done
 
 # check the system files now but install them later, after the new executable
 # is in place, so a failure here changes nothing
@@ -128,7 +131,8 @@ if [[ "${SKIP_TESTS:-0}" == 1 ]]; then
     warn "SKIP_TESTS=1: not running go test"
 else
     log "Running tests"
-    go test ./...
+    TEST_CONFIG="$(mktemp -d)"
+    XDG_CONFIG_HOME="$TEST_CONFIG" go test ./...
 fi
 
 log "Building build/$BINARY_NAME"
@@ -158,12 +162,13 @@ fi
 
 wait_until_healthy() {
     local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    for i in 0 1 2 3 4; do
+        sleep $(( 2 ** i ))
         if systemctl is-active --quiet "$SERVICE_NAME" && \
            curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:$APP_PORT/" 2>/dev/null; then
             return 0
         fi
-        sleep 1
+        printf '    not answering yet (check %d of 5)\n' "$(( i + 1 ))"
     done
     return 1
 }

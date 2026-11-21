@@ -9,7 +9,7 @@ WorkingDirectory=@APP_DIR@
 ExecStart=@APP_DIR@/build/supertext_server
 Restart=on-failure
 RestartSec=5
-Environment=XDG_DATA_HOME=@APP_HOME@/.local/share
+Environment=SUPERTEXT_DATA_DIR=/etc/supertext
 
 [Install]
 WantedBy=multi-user.target
