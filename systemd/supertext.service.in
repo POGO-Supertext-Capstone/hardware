@@ -1,0 +1,15 @@
+[Unit]
+Description=Supertext Opera Server
+After=network.target NetworkManager.service dnsmasq.service
+
+[Service]
+Type=simple
+User=@APP_USER@
+WorkingDirectory=@APP_DIR@
+ExecStart=@APP_DIR@/build/supertext_server
+Restart=on-failure
+RestartSec=5
+Environment=SUPERTEXT_DATA_DIR=/etc/supertext
+
+[Install]
+WantedBy=multi-user.target
